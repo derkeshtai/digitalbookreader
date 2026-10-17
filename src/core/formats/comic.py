@@ -9,12 +9,14 @@ The archive kind (zip / rar / 7z) is normally supplied by the content-based dete
 :mod:`detect`; when unknown it is inferred from the extension and then re-checked against
 the file's magic bytes so a mislabelled ``.cbr`` no longer fails with "not an unrar file".
 """
+import re
 import zipfile
 from pathlib import Path
 
-from ..pagesource import PageSource, _LRU
+from ..pagesource import _LRU, PageSource
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+MAX_PAGE_BYTES = 64 * 1024 * 1024
 
 _MIME_BY_EXT = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
@@ -24,6 +26,11 @@ _MIME_BY_EXT = {
 
 def mime_for_ext(ext: str) -> str:
     return _MIME_BY_EXT.get((ext or "").lower(), "application/octet-stream")
+
+
+def _natural_sort_key(name: str):
+    return tuple(int(part) if part.isdigit() else part.casefold()
+                 for part in re.split(r"(\d+)", name))
 
 
 def kind_from_path(path: Path) -> str | None:
@@ -64,6 +71,7 @@ class ComicPageSource(PageSource):
         kind = self.kind
         if kind == "rar":
             import rarfile
+
             from .rar_tool import configure_unrar
             configure_unrar()
             h = rarfile.RarFile(str(self.path))
@@ -74,18 +82,27 @@ class ComicPageSource(PageSource):
             h = zipfile.ZipFile(str(self.path))
         self._handle = h
         if self._names is None:
-            self._names = self._list_names(h, kind)
+            try:
+                self._names = self._list_names(h, kind)
+            except Exception:
+                self._handle = None
+                try:
+                    h.close()
+                except OSError:
+                    pass
+                raise
 
     @staticmethod
     def _member_names(h, kind: str) -> list[str]:
         names = h.getnames() if kind == "7z" else h.namelist()
-        return sorted(n for n in names
-                      if not n.endswith("/") and Path(n).suffix.lower() in IMAGE_EXTS)
+        pages = [n for n in names
+                 if not n.endswith("/") and Path(n).suffix.lower() in IMAGE_EXTS]
+        return sorted(pages, key=_natural_sort_key)
 
     def _list_names(self, h, kind: str) -> list[str]:
         try:
             return self._member_names(h, kind)
-        except Exception as e:  # noqa: BLE001 - surface a clear message for bad archives
+        except Exception as e:
             raise ValueError(
                 f"No se pudo leer el archivo como {kind.upper()} "
                 f"(¿está dañado o con otra extensión real?): {e}"
@@ -94,14 +111,37 @@ class ComicPageSource(PageSource):
     def _read_member(self, name: str) -> bytes:
         kind = self.kind
         h = self._handle
-        if kind == "rar":
-            return h.read(name)
         if kind == "7z":
-            res = h.read([name])  # {archive_dir: {filename: BytesIO}}
-            for d in res.values():
-                for bio in d.values():
-                    return bio.read()
-            raise KeyError(name)
+            # py7zr 1.x removed SevenZipFile.read(); use an in-memory writer factory
+            # instead of extracting the whole archive or writing untrusted paths to disk.
+            if hasattr(h, "read"):
+                result = h.read([name])
+                for directory in result.values():
+                    for bio in directory.values():
+                        data = bio.read()
+                        if len(data) > MAX_PAGE_BYTES:
+                            raise ValueError(f"La imagen {name!r} excede el límite de tamaño.")
+                        return data
+                raise KeyError(name)
+            entry = next((item for item in h.list() if item.filename == name), None)
+            if entry and entry.uncompressed and entry.uncompressed > MAX_PAGE_BYTES:
+                raise ValueError(f"La imagen {name!r} excede el límite de tamaño.")
+            from py7zr.io import BytesIOFactory
+            factory = BytesIOFactory(limit=MAX_PAGE_BYTES)
+            try:
+                h.extract(targets=[name], factory=factory)
+                data = factory.get(name).read()
+            finally:
+                # A SevenZipFile worker retains decoder state after extraction.
+                # Reset it so later random page requests do not fail CRC checks.
+                if hasattr(h, "reset"):
+                    h.reset()
+            if len(data) > MAX_PAGE_BYTES:
+                raise ValueError(f"La imagen {name!r} excede el límite de tamaño.")
+            return data
+        info = h.getinfo(name)
+        if info.file_size > MAX_PAGE_BYTES:
+            raise ValueError(f"La imagen {name!r} excede el límite de {MAX_PAGE_BYTES // (1024 * 1024)} MB.")
         return h.read(name)
 
     # -- PageSource API --------------------------------------------------------

@@ -5,7 +5,9 @@ Stored at: %LOCALAPPDATA%/Digital Book Reader/settings.ini
 from configparser import ConfigParser
 from pathlib import Path
 
-BASE_DIR = Path.home() / "AppData" / "Local" / "Digital Book Reader"
+from .app_paths import data_dir
+
+BASE_DIR = data_dir()
 SETTINGS_FILE = BASE_DIR / "settings.ini"
 
 

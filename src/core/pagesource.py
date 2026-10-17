@@ -22,10 +22,16 @@ class _LRU(OrderedDict):
         super().__init__()
         self.capacity = max(1, int(capacity))
 
+    def get(self, key, default=None):
+        """Return *key* and refresh its recency, like a true LRU cache."""
+        if key not in self:
+            return default
+        self.move_to_end(key)
+        return super().get(key, default)
+
     def put(self, key, value) -> None:
-        if key in self:
-            self.move_to_end(key)
         self[key] = value
+        self.move_to_end(key)
         while len(self) > self.capacity:
             self.popitem(last=False)
 

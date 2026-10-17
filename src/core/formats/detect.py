@@ -1,30 +1,50 @@
-"""Content-based format detection (magic bytes).
+"""Content-based book/document format detection (magic bytes and ZIP metadata).
 
-Used to route a file to the right parser based on what it *actually* is, not just
-its extension. This fixes files whose name lies about their contents — e.g. a
-``.cbr`` that is really a ZIP or 7z archive no longer fails with "not an unrar
-file", and extensionless books open correctly too.
-
-The returned ``kind`` is one of:
-    epub | zip | rar | 7z | pdf | fb2 | mobi | txt | unknown
+Detection is deliberately tolerant of wrong or missing filename extensions. It
+recognizes the formats supported by :mod:`src.core.formats` and returns a
+canonical kind string used for parser dispatch.
 """
+from __future__ import annotations
+
 import zipfile
 from pathlib import Path
 
-_RAR = b"Rar!\x1a\x07"                 # RAR4 / RAR5 header (first 6 bytes)
-_ZIP_LOCAL = b"PK\x03\x04"             # local file header
-_ZIP_EMPTY = b"PK\x05\x06"             # empty archive
-_ZIP_SPAN = b"PK\x07\x08"              # spanned archive
-_7Z = b"\x37\x7a\xbc\xaf\x27\x1c"      # 7z signature
+_RAR = b"Rar!\x1a\x07"
+_ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+_7Z = b"\x37\x7a\xbc\xaf\x27\x1c"
 
 
 def _head(path: Path, n: int = 8192) -> bytes:
-    with open(path, "rb") as fh:
+    with path.open("rb") as fh:
         return fh.read(n)
 
 
+def _zip_kind(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = {name.lower() for name in archive.namelist()}
+            if "mimetype" in names:
+                name = next(name for name in archive.namelist() if name.lower() == "mimetype")
+                mimetype = archive.read(name).strip().lower()
+                if mimetype == b"application/epub+zip":
+                    return "epub"
+                if mimetype == b"application/vnd.oasis.opendocument.text":
+                    return "odt"
+            if "meta-inf/container.xml" in names:
+                return "epub"
+            if "[content_types].xml" in names and "word/document.xml" in names:
+                return "docx"
+            if "content.xml" in names and "meta-inf/manifest.xml" in names:
+                # ODT files normally have the mimetype entry too; this is a fallback
+                # for files produced by less strict office suites.
+                return "odt"
+    except (OSError, zipfile.BadZipFile, RuntimeError):
+        pass
+    return "zip"
+
+
 def detect_kind(path: str | Path) -> str:
-    """Return the canonical content kind for *path* (see module docstring)."""
+    """Return a canonical kind or ``unknown`` for *path*."""
     p = Path(path)
     try:
         head = _head(p)
@@ -33,64 +53,57 @@ def detect_kind(path: str | Path) -> str:
     if not head:
         return "unknown"
 
-    # RAR archives (a real CBR). Checked before ZIP — the signatures differ.
     if head.startswith(_RAR):
         return "rar"
-    # 7z archives.
-    if head[:6] == _7Z:
+    if head.startswith(_7Z):
         return "7z"
-    # PDF (allow a small amount of leading whitespace / BOM).
     if b"%PDF-" in head[:1024]:
         return "pdf"
+    if head.lstrip().startswith(b"{\\rtf"):
+        return "rtf"
 
-    # ZIP family: CBZ, EPUB or plain image zip. Distinguish EPUB by marker files.
-    if any(head[:4] == z for z in (_ZIP_LOCAL, _ZIP_EMPTY, _ZIP_SPAN)):
-        try:
-            with zipfile.ZipFile(p) as zf:
-                lower = {n.lower() for n in zf.namelist()}
-            if "mimetype" in lower or "meta-inf/container.xml" in lower:
-                return "epub"
-        except Exception:  # noqa: BLE001 - not a readable zip; treat as plain zip
-            pass
-        return "zip"
-
-    low = head[:4096].lower()
-    # FB2 (FictionBook) is XML with an <fbk...> root or a FictionBook tag.
-    if b"<fbk" in low or b"fictionbook" in low:
-        return "fb2"
-
-    # MOBI / AZW3 (PalmDOC): first byte 0x78/0x99 and 'MOBI' at offset 34.
-    if len(head) >= 38 and head[0] in (0x78, 0x99) and head[34:38] == b"MOBI":
+    # Palm Database files commonly identify themselves as BOOKMOBI at byte 60.
+    # Some PRC variants use TEXtREAd; the extension fallback handles those too.
+    if len(head) >= 68 and head[60:68] in (b"BOOKMOBI", b"TEXtREAd"):
+        return "mobi"
+    if b"MOBI" in head[:8192]:
         return "mobi"
 
-    # Plain-text fallback heuristic.
+    if head[:4] in _ZIP_SIGNATURES:
+        return _zip_kind(p)
+
+    low = head[:4096].lower()
+    if b"fictionbook" in low or b"<fbk" in low:
+        return "fb2"
+    if b"<!doctype html" in low or b"<html" in low or b"<body" in low:
+        return "html"
+
     if _looks_like_text(head[:2048]):
         return "txt"
-
     return "unknown"
 
 
-def _looks_like_text(b: bytes) -> bool:
-    """Heuristic: mostly printable, decodable as UTF-8/Latin-1, few control chars."""
-    if not b:
-        return False
-    if b.count(0) > len(b) * 0.01:          # NULs => binary
+def _looks_like_text(data: bytes) -> bool:
+    """Heuristic for plain text which excludes binary data and NUL-heavy files."""
+    if not data or data.count(0) > len(data) * 0.01:
         return False
     try:
-        s = b.decode("utf-8")
+        text = data.decode("utf-8-sig")
     except UnicodeDecodeError:
         try:
-            s = b.decode("latin-1")
-        except Exception:  # noqa: BLE001
-            return False
-    printable = sum(ch.isprintable() or ch.isspace() for ch in s)
-    ctrl = sum(1 for c in b if (c < 9 or (13 < c < 32)))
-    return (printable / len(s)) > 0.95 and ctrl < len(b) * 0.02
+            text = data.decode("cp1252")
+        except UnicodeDecodeError:
+            text = data.decode("latin-1")
+    printable = sum(char.isprintable() or char.isspace() for char in text)
+    controls = sum(byte < 9 or 13 < byte < 32 for byte in data)
+    return bool(text) and printable / len(text) > 0.95 and controls < len(data) * 0.02
 
 
 def kind_to_ext(kind: str) -> str | None:
-    """Map a detected kind to the extension the parser dispatch expects."""
+    """Map a detected kind to a representative supported extension."""
     return {
         "epub": ".epub", "zip": ".cbz", "rar": ".cbr", "7z": ".7z",
-        "pdf": ".pdf", "fb2": ".fb2", "txt": ".txt",
+        "pdf": ".pdf", "fb2": ".fb2", "txt": ".txt", "docx": ".docx",
+        "odt": ".odt", "rtf": ".rtf", "html": ".html", "markdown": ".md",
+        "mobi": ".mobi",
     }.get(kind)

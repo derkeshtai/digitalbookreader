@@ -1,11 +1,8 @@
-"""Format registry: parse any supported book into renderable HTML / a page source.
+"""Format registry for books and office documents.
 
-Implemented now: EPUB, TXT, FB2, PDF and comic archives (CBZ/CBR/ZIP/7Z). Comics and PDFs
-are *streaming* — they expose an on-demand :class:`~src.core.pagesource.PageSource` instead
-of materialising every page up front, which keeps opening fast.
-
-Dispatch is by **content** (magic bytes via :func:`detect.detect_kind`) with a fallback to
-the file extension, so a mislabelled ``.cbr`` that is really a ZIP/7z still opens correctly.
+Supported input includes EPUB, unencrypted MOBI/PRC/AZW/AZW3, FB2, PDF, TXT,
+HTML/XHTML, Markdown, RTF, DOCX, ODT, and image-based comic archives (CBZ/CBR/ZIP/7Z).
+PDFs and comic archives are streamed page-by-page; document parsers return HTML.
 """
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,59 +11,86 @@ from typing import Optional
 
 @dataclass
 class BookContent:
-    html: str                        # body HTML (no <html> wrapper)
-    toc: list[tuple[str, str]]       # [(title, anchor_id), ...]
+    html: str
+    toc: list[tuple[str, str]]
     title: str
     author: str
     cover_path: Optional[Path] = None
     total_pages: int = 1
-    base_url: Optional[str] = None   # legacy local dir for relative resources
-    page_source: Optional[object] = None  # on-demand PageSource (streaming books)
+    base_url: Optional[str] = None
+    page_source: Optional[object] = None
 
 
 class NotSupportedError(Exception):
     def __init__(self, fmt: str) -> None:
-        super().__init__(f"Formato '{fmt}' aún no implementado.")
+        super().__init__(f"Formato '{fmt}' aún no es compatible o no se reconoce.")
 
-SUPPORTED_EXTS = {".epub", ".mobi", ".prc", ".fb2", ".pdf", ".txt",
-                  ".cbz", ".cbr", ".zip", ".7z"}
 
-# extension -> content kind, used when magic-byte detection is inconclusive.
+SUPPORTED_EXTS = {
+    ".epub", ".mobi", ".prc", ".azw", ".azw3", ".fb2", ".pdf", ".txt",
+    ".cbz", ".cbr", ".zip", ".7z", ".html", ".htm", ".xhtml", ".md",
+    ".markdown", ".rtf", ".docx", ".odt",
+}
+
+# Extension fallback for damaged, encrypted, or otherwise inconclusive headers.
 _EXT_KIND = {
     ".epub": "epub", ".pdf": "pdf", ".fb2": "fb2", ".txt": "txt",
     ".cbz": "zip", ".zip": "zip", ".cbr": "rar", ".7z": "7z",
+    ".mobi": "mobi", ".prc": "mobi", ".azw": "mobi", ".azw3": "mobi",
+    ".html": "html", ".htm": "html", ".xhtml": "html",
+    ".md": "markdown", ".markdown": "markdown", ".rtf": "rtf",
+    ".docx": "docx", ".odt": "odt",
 }
 
 
 def parse(path: str | Path) -> BookContent:
-    """Parse *path* into :class:`BookContent`, dispatching by detected content kind."""
+    """Parse *path* based on its detected contents, then fall back to its extension."""
     from .detect import detect_kind
 
     p = Path(path)
-    ext = p.suffix.lower()
-    if ext not in SUPPORTED_EXTS:
-        raise NotSupportedError(ext or "desconocido")
-
-    # Trust the file's actual contents first; fall back to what the extension implies.
     kind = detect_kind(p)
+    ext_kind = _EXT_KIND.get(p.suffix.lower())
+    # Markdown is text by nature, so magic-byte detection correctly calls it text;
+    # its explicit extension is the only reliable way to select Markdown rendering.
+    if kind == "txt" and ext_kind in {"markdown", "mobi"}:
+        kind = ext_kind
     if kind == "unknown":
-        kind = _EXT_KIND.get(ext, "unknown")
+        kind = ext_kind or "unknown"
+    if kind == "unknown":
+        raise NotSupportedError(p.suffix.lstrip(".") or "desconocido")
 
-    from .epub import parse_epub
-    from .txt import parse_txt
-    from .fb2 import parse_fb2
-    from .comic import parse_comic
-    from .pdf import parse_pdf
     if kind == "epub":
+        from .epub import parse_epub
         return parse_epub(p)
     if kind == "txt":
+        from .txt import parse_txt
         return parse_txt(p)
     if kind == "fb2":
+        from .fb2 import parse_fb2
         return parse_fb2(p)
-    if kind in ("zip", "rar", "7z"):
+    if kind in {"zip", "rar", "7z"}:
+        from .comic import parse_comic
         return parse_comic(p, kind=kind)
     if kind == "pdf":
+        from .pdf import parse_pdf
         return parse_pdf(p)
+    if kind == "mobi":
+        from .mobi import parse_mobi
+        return parse_mobi(p)
+    if kind == "html":
+        from .html import parse_html
+        return parse_html(p)
+    if kind == "markdown":
+        from .markdown import parse_markdown
+        return parse_markdown(p)
+    if kind == "rtf":
+        from .rtf import parse_rtf
+        return parse_rtf(p)
+    if kind == "docx":
+        from .docx import parse_docx
+        return parse_docx(p)
+    if kind == "odt":
+        from .odt import parse_odt
+        return parse_odt(p)
 
-    # Detected as a known-but-unimplemented format (mobi/prc), or still unknown.
-    raise NotSupportedError(ext.lstrip(".") or kind)
+    raise NotSupportedError(p.suffix.lstrip(".") or kind)

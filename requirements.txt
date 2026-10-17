@@ -1,0 +1,12 @@
+# Windows desktop UI and embedded reader view.
+PySide6>=6.7
+
+# Core reader support for PDF and compressed comic archives.
+PyMuPDF>=1.24
+rarfile>=4.2
+py7zr>=0.20
+
+# Additional document formats.
+Markdown>=3.6
+striprtf>=0.0.33
+mobi>=0.4.1

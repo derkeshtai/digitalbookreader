@@ -9,11 +9,17 @@ zoom/scroll responsive.
 The server binds to ``127.0.0.1`` on an ephemeral port (no network exposure) and runs in a
 daemon thread. It is process-wide singleton via :func:`get_page_server`.
 """
+from __future__ import annotations
+
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .pagesource import PageSource
 
 # book_id -> PageSource
-_registry: dict[str, "PageSource"] = {}
+_registry: dict[str, PageSource] = {}
 _reg_lock = threading.Lock()
 
 
@@ -84,7 +90,7 @@ class PageServer:
         self._port = self._httpd.server_address[1]
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
 
-    def register(self, book_id: str, source: "PageSource") -> None:
+    def register(self, book_id: str, source: PageSource) -> None:
         with _reg_lock:
             old = _registry.get(book_id)
             _registry[book_id] = source

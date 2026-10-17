@@ -6,7 +6,7 @@ loopback HTTP server) and the export-to-images feature.
 """
 from pathlib import Path
 
-from ..pagesource import PageSource, _LRU
+from ..pagesource import _LRU, PageSource
 
 DPI = 150  # render resolution for on-demand page images
 
@@ -77,7 +77,10 @@ def parse_pdf(path: str | Path):
 
     p = Path(path)
     src = PdfPageSource(p)
-    n = max(1, src.total_pages)
+    n = src.total_pages
+    if n < 1:
+        src.close()
+        raise ValueError("El PDF no contiene páginas para mostrar.")
 
     parts = [
         "<style>",
